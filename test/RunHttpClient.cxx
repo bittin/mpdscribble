@@ -1,53 +1,61 @@
 #include "lib/curl/Global.hxx"
+#include "lib/curl/Init.hxx"
 #include "lib/curl/Request.hxx"
+#include "lib/curl/Handler.hxx"
+#include "event/Loop.hxx"
 #include "util/PrintException.hxx"
 
-#include <boost/asio/io_service.hpp>
+#include <fmt/core.h>
 
-#include <assert.h>
-#include <stdio.h>
+#include <cassert>
+
 #include <stdlib.h>
 #include <unistd.h>
 
-static boost::asio::io_service io_service;
+static EventLoop event_loop;
 static std::exception_ptr error;
 static bool quit;
 
-static void
-my_response(std::string body, void *)
+class MyResponseHandler final : public HttpResponseHandler {
+public:
+	/* virtual methods from class HttpResponseHandler */
+	void OnHttpResponse(std::string body) noexcept override;
+	void OnHttpError(std::exception_ptr e) noexcept override;
+};
+
+void
+MyResponseHandler::OnHttpResponse(std::string body) noexcept
 {
 	write(STDOUT_FILENO, body.data(), body.size());
-	io_service.stop();
+	event_loop.Break();
 	quit = true;
 }
 
-static void
-my_error(std::exception_ptr _error, void *)
+void
+MyResponseHandler::OnHttpError(std::exception_ptr _error) noexcept
 {
 	error = _error;
-	io_service.stop();
+	event_loop.Break();
 	quit = true;
 }
-
-static constexpr HttpResponseHandler my_handler = {
-	.response = my_response,
-	.error = my_error,
-};
 
 int
 main(int argc, char **argv)
 {
 	if (argc != 2) {
-		fprintf(stderr, "Usage: run_http_client URL\n");
+		fmt::print(stderr, "Usage: run_http_client URL\n");
 		return EXIT_FAILURE;
 	}
 
-	CurlGlobal curl_global(io_service, nullptr);
+	const ScopeCurlInit init;
+	CurlGlobal curl_global(event_loop, nullptr);
 
 	const char *url = argv[1];
-	CurlRequest request(curl_global, url, {}, my_handler, nullptr);
+
+	MyResponseHandler handler;
+	CurlRequest request(curl_global, url, {}, handler);
 	if (!quit)
-		io_service.run();
+		event_loop.Run();
 	assert(quit);
 
 	if (error) {

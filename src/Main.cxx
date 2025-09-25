@@ -1,22 +1,5 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "Instance.hxx"
 #include "Daemon.hxx"
@@ -24,20 +7,20 @@
 #include "ReadConfig.hxx"
 #include "Config.hxx"
 #include "Log.hxx"
+#include "lib/curl/Init.hxx"
 #include "util/PrintException.hxx"
 #include "SdDaemon.hxx"
 
+#ifndef _WIN32
+#include "lib/gcrypt/Init.hxx"
+#endif
+
 #include <stdlib.h>
-#include <unistd.h>
 
 static std::chrono::steady_clock::duration
 GetSongDuration(const struct mpd_song *song) noexcept
 {
-#if LIBMPDCLIENT_CHECK_VERSION(2,10,0)
 	return std::chrono::milliseconds(mpd_song_get_duration_ms(song));
-#else
-	return std::chrono::seconds(mpd_song_get_duration(song));
-#endif
 }
 
 static constexpr bool
@@ -69,17 +52,27 @@ song_repeated(const struct mpd_song *song,
 				   GetSongDuration(song));
 }
 
+static const char *
+artist(const struct mpd_song *song) noexcept
+{
+	if (mpd_song_get_tag(song, MPD_TAG_ARTIST, 0) != nullptr) {
+		return mpd_song_get_tag(song, MPD_TAG_ARTIST, 0);
+	} else {
+		return mpd_song_get_tag(song, MPD_TAG_ALBUM_ARTIST, 0);
+	}
+}
+
 void
 Instance::OnMpdSongChanged(const struct mpd_song *song) noexcept
 {
-	FormatInfo("new song detected (%s - %s), id: %u, pos: %u\n",
-		   mpd_song_get_tag(song, MPD_TAG_ARTIST, 0),
-		   mpd_song_get_tag(song, MPD_TAG_TITLE, 0),
-		   mpd_song_get_id(song), mpd_song_get_pos(song));
+	FmtInfo("new song detected ({} - {}), id: {}, pos: {}\n",
+		artist(song),
+		mpd_song_get_tag(song, MPD_TAG_TITLE, 0),
+		mpd_song_get_id(song), mpd_song_get_pos(song));
 
 	stopwatch.Start();
 
-	scrobblers.NowPlaying(mpd_song_get_tag(song, MPD_TAG_ARTIST, 0),
+	scrobblers.NowPlaying(artist(song),
 			      mpd_song_get_tag(song, MPD_TAG_TITLE, 0),
 			      mpd_song_get_tag(song, MPD_TAG_ALBUM, 0),
 			      mpd_song_get_tag(song, MPD_TAG_TRACK, 0),
@@ -148,7 +141,7 @@ Instance::OnMpdEnded(const struct mpd_song *song, bool love) noexcept
 	/* FIXME:
 	   libmpdclient doesn't have any way to fetch the musicbrainz id. */
 	scrobblers.SongChange(mpd_song_get_uri(song),
-			      mpd_song_get_tag(song, MPD_TAG_ARTIST, 0),
+			      artist(song),
 			      mpd_song_get_tag(song, MPD_TAG_TITLE, 0),
 			      mpd_song_get_tag(song, MPD_TAG_ALBUM, 0),
 			      mpd_song_get_tag(song, MPD_TAG_TRACK, 0),
@@ -182,6 +175,11 @@ try {
 	if (!config.no_daemon)
 #endif
 		daemonize_close_stdout_stderr();
+
+#ifndef _WIN32
+	Gcrypt::Init();
+#endif
+	const ScopeCurlInit init;
 
 	Instance instance(config);
 

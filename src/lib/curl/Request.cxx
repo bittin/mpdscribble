@@ -1,25 +1,10 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Project homepage: http://musicpd.org
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
- */
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "Request.hxx"
+#include "Handler.hxx"
 #include "Global.hxx"
-#include "util/RuntimeError.hxx"
+#include "lib/fmt/RuntimeError.hxx"
 #include "config.h"
 
 #include <curl/curl.h>
@@ -33,19 +18,17 @@ enum {
 
 CurlRequest::CurlRequest(CurlGlobal &_global,
 			 const char *url, std::string &&_request_body,
-			 const HttpResponseHandler &_handler,
-			 void *_ctx)
+			 HttpResponseHandler &_handler)
 	:global(_global),
-	 handler(_handler), handler_ctx(_ctx),
+	 handler(_handler),
 	 curl(url),
 	 request_body(std::move(_request_body))
 {
 	curl.SetPrivate(this);
 	curl.SetUserAgent(PACKAGE "/" VERSION);
 	curl.SetWriteFunction(WriteFunction, this);
-	curl.SetOption(CURLOPT_FAILONERROR, true);
 	curl.SetOption(CURLOPT_ERRORBUFFER, error);
-	curl.SetOption(CURLOPT_BUFFERSIZE, (long)2048);
+	curl.SetFailOnError();
 
 	if (!request_body.empty()) {
 		curl.SetOption(CURLOPT_POST, true);
@@ -54,17 +37,17 @@ CurlRequest::CurlRequest(CurlGlobal &_global,
 	}
 
 	global.Configure(curl);
-	global.Add(curl.Get());
+	global.Add(*this);
 }
 
 CurlRequest::~CurlRequest() noexcept
 {
 	if (curl)
-		global.Remove(curl.Get());
+		global.Remove(*this);
 }
 
 inline void
-CurlRequest::CheckResponse(CURLcode result, long status)
+CurlRequest::CheckResponse(CURLcode result)
 {
 	if (result == CURLE_WRITE_ERROR &&
 	    /* handle the postponed error that was caught in
@@ -72,23 +55,19 @@ CurlRequest::CheckResponse(CURLcode result, long status)
 	    response_body.length() > MAX_RESPONSE_BODY)
 		throw std::runtime_error("response body is too large");
 	else if (result != CURLE_OK)
-		throw FormatRuntimeError("CURL failed: %s",
-					 error);
-	else if (status < 200 || status >= 300)
-		throw FormatRuntimeError("got HTTP status %ld",
-					 status);
+		throw FmtRuntimeError("CURL failed: {}", error);
 }
 
 void
-CurlRequest::Done(CURLcode result, long status) noexcept
+CurlRequest::Done(CURLcode result) noexcept
 {
 	/* invoke the handler method */
 
 	try {
-		CheckResponse(result, status);
-		handler.response(std::move(response_body), handler_ctx);
+		CheckResponse(result);
+		handler.OnHttpResponse(std::move(response_body));
 	} catch (...) {
-		handler.error(std::current_exception(), handler_ctx);
+		handler.OnHttpError(std::current_exception());
 	}
 }
 

@@ -1,29 +1,15 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "Daemon.hxx"
+#include "lib/fmt/RuntimeError.hxx"
+#include "lib/fmt/SystemError.hxx"
 #include "system/Error.hxx"
-#include "util/RuntimeError.hxx"
 #include "Log.hxx"
 
 #ifndef _WIN32
+#include <fmt/core.h>
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -94,23 +80,21 @@ daemonize_set_user()
 
 	/* get uid */
 	if (setgid(user_gid) == -1)
-		throw FormatErrno("cannot setgid for user \"%s\"",
-				  user_name);
+		throw FmtErrno("cannot setgid for user {:?}", user_name);
 
 #ifdef _BSD_SOURCE
 	/* init suplementary groups
 	 * (must be done before we change our uid)
 	 */
 	if (initgroups(user_name, user_gid) == -1)
-		FormatErrno("cannot init supplementary groups "
-			    "of user \"%s\": %s",
-			    user_name, strerror(errno));
+		FmtErrno("cannot init supplementary groups of user {:?}",
+			 user_name);
 #endif
 
 	/* set uid */
 	if (setuid(user_uid) == -1)
-		throw FormatErrno("cannot change to uid of user \"%s\"",
-				  user_name);
+		throw FmtErrno("cannot change to uid of user {:?}",
+			       user_name);
 #endif
 }
 
@@ -155,9 +139,9 @@ daemonize_write_pidfile()
 
 	file = fopen(pidfile, "w");
 	if (file == nullptr)
-		throw FormatErrno("Failed to create pidfile %s", pidfile);
+		throw FmtErrno("Failed to create pidfile {:?}", pidfile);
 
-	fprintf(file, "%d\n", getpid());
+	fmt::print(file, "{}\n", getpid());
 	fclose(file);
 #endif
 }
@@ -169,8 +153,7 @@ daemonize_init(const char *user, const char *_pidfile)
 	if (user != nullptr) {
 		const auto *pwd = getpwnam(user);
 		if (pwd == nullptr)
-			throw FormatRuntimeError("no such user \"%s\"",
-						 user);
+			throw FmtRuntimeError("no such user {:?}", user);
 
 		user_uid = pwd->pw_uid;
 		user_gid = pwd->pw_gid;

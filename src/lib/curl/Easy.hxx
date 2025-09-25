@@ -1,42 +1,19 @@
-/*
- * Copyright 2016-2018 Max Kellermann <max.kellermann@gmail.com>
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * - Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *
- * - Redistributions in binary form must reproduce the above copyright
- * notice, this list of conditions and the following disclaimer in the
- * documentation and/or other materials provided with the
- * distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
- * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
- * FOUNDATION OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
- * OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+// SPDX-License-Identifier: BSD-2-Clause
+// author: Max Kellermann <max.kellermann@gmail.com>
 
-#ifndef CURL_EASY_HXX
-#define CURL_EASY_HXX
+#pragma once
 
-#include "util/Compiler.h"
+#include "Error.hxx"
+#include "String.hxx"
 
 #include <curl/curl.h>
 
-#include <utility>
-#include <stdexcept>
+#include <chrono>
 #include <cstddef>
+#include <span>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 
 /**
  * An OO wrapper for a "CURL*" (a libCURL "easy" handle).
@@ -89,10 +66,15 @@ public:
 	}
 
 	template<typename T>
+	CURLcode TrySetOption(CURLoption option, T value) noexcept {
+		return curl_easy_setopt(handle, option, value);
+	}
+
+	template<typename T>
 	void SetOption(CURLoption option, T value) {
-		CURLcode code = curl_easy_setopt(handle, option, value);
+		CURLcode code = TrySetOption(option, value);
 		if (code != CURLE_OK)
-			throw std::runtime_error(curl_easy_strerror(code));
+			throw Curl::MakeError(code, "Failed to set option");
 	}
 
 	void SetPrivate(void *pointer) {
@@ -127,6 +109,13 @@ public:
 		SetOption(CURLOPT_NOPROGRESS, (long)value);
 	}
 
+	void SetXferInfoFunction(curl_xferinfo_callback function,
+				 void *data) {
+		SetOption(CURLOPT_XFERINFOFUNCTION, function);
+		SetOption(CURLOPT_XFERINFODATA, data);
+		SetNoProgress(false);
+	}
+
 	void SetNoSignal(bool value=true) {
 		SetOption(CURLOPT_NOSIGNAL, (long)value);
 	}
@@ -135,12 +124,28 @@ public:
 		SetOption(CURLOPT_FAILONERROR, (long)value);
 	}
 
-	void SetConnectTimeout(long timeout) {
-		SetOption(CURLOPT_CONNECTTIMEOUT, timeout);
+	void SetVerifyHost(bool value) {
+		SetOption(CURLOPT_SSL_VERIFYHOST, value ? 2L : 0L);
 	}
 
-	void SetTimeout(long timeout) {
-		SetOption(CURLOPT_TIMEOUT, timeout);
+	void SetVerifyPeer(bool value) {
+		SetOption(CURLOPT_SSL_VERIFYPEER, (long)value);
+	}
+
+	void SetProxyVerifyHost(bool value) {
+		SetOption(CURLOPT_PROXY_SSL_VERIFYHOST, value ? 2L : 0L);
+	}
+
+	void SetProxyVerifyPeer(bool value) {
+		SetOption(CURLOPT_PROXY_SSL_VERIFYPEER, value);
+	}
+
+	void SetConnectTimeout(std::chrono::duration<long> timeout) {
+		SetOption(CURLOPT_CONNECTTIMEOUT, timeout.count());
+	}
+
+	void SetTimeout(std::chrono::duration<long> timeout) {
+		SetOption(CURLOPT_TIMEOUT, timeout.count());
 	}
 
 	void SetHeaderFunction(size_t (*function)(char *buffer, size_t size,
@@ -178,8 +183,16 @@ public:
 		SetOption(CURLOPT_POSTFIELDSIZE, (long)size);
 	}
 
-	void SetHttpPost(const struct curl_httppost *post) {
-		SetOption(CURLOPT_HTTPPOST, post);
+	void SetRequestBody(std::span<const std::byte> s) {
+		SetRequestBody(s.data(), s.size());
+	}
+
+	void SetRequestBody(std::string_view s) {
+		SetRequestBody(s.data(), s.size());
+	}
+
+	void SetMimePost(const curl_mime *mime) {
+		SetOption(CURLOPT_MIMEPOST, mime);
 	}
 
 	template<typename T>
@@ -190,27 +203,25 @@ public:
 	/**
 	 * Returns the response body's size, or -1 if that is unknown.
 	 */
-	gcc_pure
-	int64_t GetContentLength() const noexcept {
-		double value;
-		return GetInfo(CURLINFO_CONTENT_LENGTH_DOWNLOAD, &value)
-			? (int64_t)value
+	[[gnu::pure]]
+	curl_off_t GetContentLength() const noexcept {
+		curl_off_t value;
+		return GetInfo(CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &value)
+			? value
 			: -1;
 	}
 
 	void Perform() {
 		CURLcode code = curl_easy_perform(handle);
 		if (code != CURLE_OK)
-			throw std::runtime_error(curl_easy_strerror(code));
+			throw Curl::MakeError(code, "CURL failed");
 	}
 
 	bool Unpause() noexcept {
 		return ::curl_easy_pause(handle, CURLPAUSE_CONT) == CURLE_OK;
 	}
 
-	char *Escape(const char *string, int length=0) const noexcept {
-		return curl_easy_escape(handle, string, length);
+	CurlString Escape(const char *string, int length=0) const noexcept {
+		return CurlString(curl_easy_escape(handle, string, length));
 	}
 };
-
-#endif

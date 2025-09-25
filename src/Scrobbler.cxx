@@ -1,76 +1,63 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "Scrobbler.hxx"
 #include "Protocol.hxx"
 #include "ScrobblerConfig.hxx"
 #include "Journal.hxx"
 #include "lib/curl/Request.hxx"
+#include "lib/fmt/ExceptionFormatter.hxx"
+#include "lib/fmt/SystemError.hxx"
 #include "Form.hxx"
 #include "Log.hxx" /* for log_date() */
-#include "system/Error.hxx"
-#include "util/Exception.hxx"
+#include "util/HexFormat.hxx"
+#include "util/SpanCast.hxx"
 
-#include <gcrypt.h>
+#ifdef _WIN32
+#include "lib/wincrypt/MD5.hxx"
+#else
+#include "lib/gcrypt/MD5.hxx"
+#endif
 
 #include <array>
+#include <cassert>
 
-#include <assert.h>
 #include <errno.h>
 #include <string.h>
 
 /* don't submit more than this amount of songs in a batch. */
 #define MAX_SUBMIT_COUNT 10
 
-static const char OK[] = "OK";
-static const char BADSESSION[] = "BADSESSION";
-static const char FAILED[] = "FAILED";
-
-typedef enum {
-	AS_SUBMIT_OK,
-	AS_SUBMIT_FAILED,
-	AS_SUBMIT_HANDSHAKE,
-} as_submitting;
+namespace ResponseStrings {
+static constexpr char OK[] = "OK";
+static constexpr char BADSESSION[] = "BADSESSION";
+static constexpr char FAILED[] = "FAILED";
+static constexpr char BANNED[] = "BANNED";
+static constexpr char BADAUTH[] = "BADAUTH";
+static constexpr char BADTIME[] = "BADTIME";
+}
 
 Scrobbler::Scrobbler(const ScrobblerConfig &_config,
-		     boost::asio::io_service &io_service,
+		     EventLoop &event_loop,
 		     CurlGlobal &_curl_global)
 	:config(_config), curl_global(_curl_global),
-	 handshake_timer(io_service),
-	 submit_timer(io_service)
+	 handshake_timer(event_loop, BIND_THIS_METHOD(OnHandshakeTimer)),
+	 submit_timer(event_loop, BIND_THIS_METHOD(OnSubmitTimer))
 {
 	if (!config.journal.empty()) {
 		queue = journal_read(config.journal.c_str());
 
 		const unsigned queue_length = queue.size();
-		FormatInfo("loaded %u song%s from %s",
-			   queue_length, queue_length == 1 ? "" : "s",
-			   config.journal.c_str());
+		FmtInfo("loaded {} song{} from {:?}",
+			queue_length, queue_length == 1 ? "" : "s",
+			config.journal);
 	}
 
 	if (!config.file.empty()) {
 		file = fopen(config.file.c_str(), "a");
 		if (file == nullptr)
-			throw FormatErrno("Failed to open file '%s' of scrobbler '%s'",
-					  config.file.c_str(),
-					  config.name.c_str());
+			throw FmtErrno("Failed to open file {:?} of scrobbler {:?}",
+				       config.file, config.name);
 	} else
 		ScheduleHandshake();
 }
@@ -84,78 +71,81 @@ Scrobbler::~Scrobbler() noexcept
 void
 Scrobbler::IncreaseInterval() noexcept
 {
-	if (interval < 60)
-		interval = 60;
+	if (interval < MIN_INTERVAL)
+		interval = MIN_INTERVAL;
 	else
-		interval <<= 1;
+		interval *= 2;
 
-	if (interval > 60 * 60 * 2)
-		interval = 60 * 60 * 2;
+	if (interval > MAX_INTERVAL)
+		interval = MAX_INTERVAL;
 
-	FormatWarning("[%s] waiting %u seconds before trying again",
-		      config.name.c_str(), interval);
+	FmtWarning("[{}] waiting {} seconds before trying again",
+		   config.name,
+		   std::chrono::duration_cast<std::chrono::duration<unsigned>>(interval).count());
 }
 
-static as_submitting
+enum class SubmitResponseType {
+	OK,
+	FAILED,
+	HANDSHAKE,
+};
+
+static SubmitResponseType
 scrobbler_parse_submit_response(const char *scrobbler_name,
 				const char *line, size_t length)
 {
-	if (length == sizeof(OK) - 1 && memcmp(line, OK, length) == 0) {
-		FormatInfo("[%s] OK", scrobbler_name);
+	using namespace ResponseStrings;
 
-		return AS_SUBMIT_OK;
+	if (length == sizeof(OK) - 1 && memcmp(line, OK, length) == 0) {
+		FmtInfo("[{}] OK", scrobbler_name);
+
+		return SubmitResponseType::OK;
 	} else if (length == sizeof(BADSESSION) - 1 &&
 		   memcmp(line, BADSESSION, length) == 0) {
-		FormatWarning("[%s] invalid session", scrobbler_name);
+		FmtWarning("[{}] invalid session", scrobbler_name);
 
-		return AS_SUBMIT_HANDSHAKE;
+		return SubmitResponseType::HANDSHAKE;
 	} else if (length == sizeof(FAILED) - 1 &&
 		   memcmp(line, FAILED, length) == 0) {
 		if (length > strlen(FAILED))
-			FormatError("[%s] submission rejected: %.*s",
-				    scrobbler_name,
-				    (int)(length - strlen(FAILED)),
-				    line + strlen(FAILED));
+			FmtError("[{}] submission rejected: {}",
+				 scrobbler_name,
+				 std::string_view{line + strlen(FAILED), length - strlen(FAILED)});
 		else
-			FormatError("[%s] submission rejected",
-				    scrobbler_name);
+			FmtError("[{}] submission rejected", scrobbler_name);
 	} else {
-		FormatError("[%s] unknown response: %.*s",
-			    scrobbler_name, (int)length, line);
+		FmtError("[{}] unknown response: {}",
+			 scrobbler_name, std::string_view{line, length});
 	}
 
-	return AS_SUBMIT_FAILED;
+	return SubmitResponseType::FAILED;
 }
 
 bool
 Scrobbler::ParseHandshakeResponse(const char *line) noexcept
 {
-	static const char *BANNED = "BANNED";
-	static const char *BADAUTH = "BADAUTH";
-	static const char *BADTIME = "BADTIME";
+	using namespace ResponseStrings;
 
 	/* FIXME: some code duplication between this
 	   and as_parse_submit_response. */
 	if (!strncmp(line, OK, strlen(OK))) {
-		FormatInfo("[%s] handshake successful",
-			   config.name.c_str());
+		FmtInfo("[{}] handshake successful", config.name);
 		return true;
 	} else if (!strncmp(line, BANNED, strlen(BANNED))) {
-		FormatError("[%s] handshake failed, we're banned (%s)",
-			    config.name.c_str(), line);
+		FmtError("[{}] handshake failed, we're banned ({:?})",
+			 config.name, line);
 	} else if (!strncmp(line, BADAUTH, strlen(BADAUTH))) {
-		FormatError("[%s] handshake failed, "
-			    "username or password incorrect (%s)",
-			    config.name.c_str(), line);
+		FmtError("[{}] handshake failed, username or password incorrect ({:?})",
+			 config.name, line);
 	} else if (!strncmp(line, BADTIME, strlen(BADTIME))) {
-		FormatError("[%s] handshake failed, clock not synchronized (%s)",
-			    config.name.c_str(), line);
+		FmtError("[{}] handshake failed, clock not synchronized ({:?})",
+			 config.name, line);
 	} else if (!strncmp(line, FAILED, strlen(FAILED))) {
-		FormatError("[%s] handshake failed (%s)",
-			    config.name.c_str(), line);
+		FmtError("[{}] handshake failed ({:?})",
+			 config.name, line);
 	} else {
-		FormatError("[%s] error parsing handshake response (%s)",
-			    config.name.c_str(), line);
+		FmtError("[{}] error parsing handshake response ({:?})",
+			 config.name, line);
 	}
 
 	return false;
@@ -176,85 +166,67 @@ next_line(const char **input_r, const char *end)
 	return line;
 }
 
-void
-Scrobbler::OnHandshakeResponse(std::string body, void *data) noexcept
+inline void
+Scrobbler::OnHandshakeResponse(std::string body) noexcept
 {
-	auto *scrobbler = (Scrobbler *)data;
 	const char *response = body.data();
 	const char *end = response + body.length();
 	bool ret;
 
-	assert(scrobbler != nullptr);
-	assert(scrobbler->config.file.empty());
-	assert(scrobbler->state == SCROBBLER_STATE_HANDSHAKE);
+	assert(config.file.empty());
+	assert(state == State::HANDSHAKE);
 
-	scrobbler->http_request.reset();
-	scrobbler->state = SCROBBLER_STATE_NOTHING;
+	http_request.reset();
+	state = State::NOTHING;
 
 	auto line = next_line(&response, end);
-	ret = scrobbler->ParseHandshakeResponse(line.c_str());
+	ret = ParseHandshakeResponse(line.c_str());
 	if (!ret) {
-		scrobbler->IncreaseInterval();
-		scrobbler->ScheduleHandshake();
+		IncreaseInterval();
+		ScheduleHandshake();
 		return;
 	}
 
-	scrobbler->session = next_line(&response, end);
-	FormatDebug("[%s] session: %s",
-		    scrobbler->config.name.c_str(),
-		    scrobbler->session.c_str());
+	session = next_line(&response, end);
+	FmtDebug("[{}] session: {:?}", config.name, session);
 
-	scrobbler->nowplay_url = next_line(&response, end);
-	FormatDebug("[%s] now playing url: %s",
-		    scrobbler->config.name.c_str(),
-		    scrobbler->nowplay_url.c_str());
+	nowplay_url = next_line(&response, end);
+	FmtDebug("[{}] now playing url: {}", config.name, nowplay_url);
 
-	scrobbler->submit_url = next_line(&response, end);
-	FormatDebug("[%s] submit url: %s",
-		    scrobbler->config.name.c_str(),
-		    scrobbler->submit_url.c_str());
+	submit_url = next_line(&response, end);
+	FmtDebug("[{}] submit url: {}", config.name, submit_url);
 
-	if (scrobbler->nowplay_url.empty() || scrobbler->submit_url.empty()) {
-		scrobbler->session.clear();
-		scrobbler->nowplay_url.clear();
-		scrobbler->submit_url.clear();
+	if (nowplay_url.empty() || submit_url.empty()) {
+		session.clear();
+		nowplay_url.clear();
+		submit_url.clear();
 
-		scrobbler->IncreaseInterval();
-		scrobbler->ScheduleHandshake();
+		IncreaseInterval();
+		ScheduleHandshake();
 		return;
 	}
 
-	scrobbler->state = SCROBBLER_STATE_READY;
-	scrobbler->interval = 1;
+	state = State::READY;
+	interval = std::chrono::seconds{1};
 
 	/* handshake was successful: see if we have songs to submit */
-	scrobbler->Submit();
+	Submit();
 }
 
-void
-Scrobbler::OnHandshakeError(std::exception_ptr e, void *data) noexcept
+inline void
+Scrobbler::OnHandshakeError(std::exception_ptr e) noexcept
 {
-	auto *scrobbler = (Scrobbler *)data;
+	assert(config.file.empty());
+	assert(state == State::HANDSHAKE);
 
-	assert(scrobbler != nullptr);
-	assert(scrobbler->config.file.empty());
-	assert(scrobbler->state == SCROBBLER_STATE_HANDSHAKE);
+	http_request.reset();
+	state = State::NOTHING;
 
-	scrobbler->http_request.reset();
-	scrobbler->state = SCROBBLER_STATE_NOTHING;
+	FmtError("[{}] handshake error: {}", config.name, e);
 
-	FormatError("[%s] handshake error: %s",
-		    scrobbler->config.name.c_str(),
-		    GetFullMessage(e).c_str());
-
-	scrobbler->IncreaseInterval();
-	scrobbler->ScheduleHandshake();
+	IncreaseInterval();
+	ScheduleHandshake();
 }
-
-static constexpr HttpResponseHandler scrobbler_handshake_handler = {
-	.response = Scrobbler::OnHandshakeResponse,
-	.error = Scrobbler::OnHandshakeError,
-};
 
 static void
 scrobbler_queue_remove_oldest(std::list<Record> &queue, unsigned count)
@@ -265,74 +237,65 @@ scrobbler_queue_remove_oldest(std::list<Record> &queue, unsigned count)
 		queue.pop_front();
 }
 
-void
-Scrobbler::OnSubmitResponse(std::string body, void *data) noexcept
+inline void
+Scrobbler::OnSubmitResponse(std::string body) noexcept
 {
-	auto *scrobbler = (Scrobbler *)data;
+	assert(config.file.empty());
+	assert(state == State::SUBMITTING);
 
-	assert(scrobbler->config.file.empty());
-	assert(scrobbler->state == SCROBBLER_STATE_SUBMITTING);
-
-	scrobbler->http_request.reset();
-	scrobbler->state = SCROBBLER_STATE_READY;
+	http_request.reset();
+	state = State::READY;
 
 	auto newline = body.find('\n');
 	if (newline != body.npos)
 		body.resize(newline);
 
-	switch (scrobbler_parse_submit_response(scrobbler->config.name.c_str(),
+	switch (scrobbler_parse_submit_response(config.name.c_str(),
 						body.data(), body.length())) {
-	case AS_SUBMIT_OK:
-		scrobbler->interval = 1;
+	case SubmitResponseType::OK:
+		interval = std::chrono::seconds{1};
 
 		/* submission was accepted, so clean up the cache. */
-		if (scrobbler->pending > 0) {
-			scrobbler_queue_remove_oldest(scrobbler->queue, scrobbler->pending);
-			scrobbler->pending = 0;
+		if (pending > 0) {
+			scrobbler_queue_remove_oldest(queue, pending);
+			pending = 0;
 		} else {
-			assert(record_is_defined(&scrobbler->now_playing));
+			assert(record_is_defined(&now_playing));
 
-			scrobbler->now_playing = {};
+			now_playing = {};
 		}
 
 
 		/* submit the next chunk (if there is some left) */
-		scrobbler->Submit();
+		Submit();
 		break;
-	case AS_SUBMIT_FAILED:
-		scrobbler->IncreaseInterval();
-		scrobbler->ScheduleSubmit();
+
+	case SubmitResponseType::FAILED:
+		IncreaseInterval();
+		ScheduleSubmit();
 		break;
-	case AS_SUBMIT_HANDSHAKE:
-		scrobbler->state = SCROBBLER_STATE_NOTHING;
-		scrobbler->ScheduleHandshake();
+
+	case SubmitResponseType::HANDSHAKE:
+		state = State::NOTHING;
+		ScheduleHandshake();
 		break;
 	}
 }
 
-void
-Scrobbler::OnSubmitError(std::exception_ptr e, void *data) noexcept
+inline void
+Scrobbler::OnSubmitError(std::exception_ptr e) noexcept
 {
-	auto *scrobbler = (Scrobbler *)data;
+	assert(config.file.empty());
+	assert(state == State::SUBMITTING);
 
-	assert(scrobbler->config.file.empty());
-	assert(scrobbler->state == SCROBBLER_STATE_SUBMITTING);
+	http_request.reset();
+	state = State::READY;
 
-	scrobbler->http_request.reset();
-	scrobbler->state = SCROBBLER_STATE_READY;
+	FmtError("[{}] submit error: {}", config.name, e);
 
-	FormatError("[%s] submit error: %s",
-		    scrobbler->config.name.c_str(),
-		    GetFullMessage(e).c_str());
-
-	scrobbler->IncreaseInterval();
-	scrobbler->ScheduleSubmit();
+	IncreaseInterval();
+	ScheduleSubmit();
 }
-
-static constexpr HttpResponseHandler scrobbler_submit_handler = {
-	.response = Scrobbler::OnSubmitResponse,
-	.error = Scrobbler::OnSubmitError,
-};
 
 static constexpr size_t MD5_SIZE = 16;
 static constexpr size_t MD5_HEX_SIZE = MD5_SIZE * 2;
@@ -342,41 +305,34 @@ static constexpr size_t MD5_HEX_SIZE = MD5_SIZE * 2;
  * value is a newly allocated string containing the hexadecimal
  * checksum.
  */
-static std::array<char, MD5_HEX_SIZE + 1>
-md5_hex(const char *p, int len)
-{
-	if (len == -1)
-		len = strlen(p);
-
-	std::array<uint8_t, MD5_SIZE> binary;
-	gcry_md_hash_buffer(GCRY_MD_MD5, &binary.front(), p, len);
-
-	std::array<char, MD5_HEX_SIZE + 1> result;
-	for (size_t i = 0; i < MD5_SIZE; ++i)
-		snprintf(&result[i * 2], 3, "%02x", binary[i]);
-
-	return result;
-}
-
 static auto
-md5_hex(const std::string &s) noexcept
+md5_hex(std::string_view s)
 {
-	return md5_hex(s.data(), s.size());
+#ifdef _WIN32
+	const auto binary = WinCrypt::MD5(AsBytes(s));
+#else
+	const auto binary = Gcrypt::MD5(AsBytes(s));
+#endif
+	return HexFormat(std::span{binary});
 }
 
 static auto
 as_md5(const std::string &password, const std::string &timestamp)
 {
-	std::array<char, MD5_HEX_SIZE + 1> buffer;
+	std::array<char, MD5_HEX_SIZE> buffer;
 
-	const char *password_md5 = password.c_str();
+	auto password_md5 = std::string_view(password);
 	if (password.length() != 32) {
 		/* assume it's not hashed yet */
 		buffer = md5_hex(password);
-		password_md5 = &buffer.front();
+		password_md5 = std::string_view(buffer.data(), MD5_HEX_SIZE);
 	}
 
-	return md5_hex(password_md5 + timestamp);
+	std::string md5_with_timestamp;
+	md5_with_timestamp.reserve(password_md5.size() + timestamp.size());
+	md5_with_timestamp.append(password_md5);
+	md5_with_timestamp.append(timestamp);
+	return md5_hex(md5_with_timestamp);
 }
 
 void
@@ -384,7 +340,7 @@ Scrobbler::Handshake() noexcept
 {
 	assert(config.file.empty());
 
-	state = SCROBBLER_STATE_HANDSHAKE;
+	state = State::HANDSHAKE;
 
 	const auto timestr = as_timestamp();
 	const auto md5 = as_md5(config.password, timestr);
@@ -395,29 +351,23 @@ Scrobbler::Handshake() noexcept
 	url.Append("p", "1.2");
 	url.Append("c", AS_CLIENT_ID);
 	url.Append("v", AS_CLIENT_VERSION);
-	url.Append("u", config.username.c_str());
-	url.Append("t", timestr.c_str());
-	url.Append("a", &md5.front());
+	url.Append("u", config.username);
+	url.Append("t", timestr);
+	url.Append("a", ToStringView(md5));
 
 	//  notice ("handshake url:\n%s", url);
 
+	HttpResponseHandler &handler = *this;
 	http_request = std::make_unique<CurlRequest>(curl_global,
 						     url.c_str(), std::string(),
-						     scrobbler_handshake_handler,
-						     this);
+						     handler);
 }
 
 void
-Scrobbler::OnHandshakeTimer(const boost::system::error_code &error) noexcept
+Scrobbler::OnHandshakeTimer() noexcept
 {
-	if (error)
-		return;
-
 	assert(config.file.empty());
-	assert(state == SCROBBLER_STATE_NOTHING);
-
-	assert(handshake_timer_scheduled);
-	handshake_timer_scheduled = false;
+	assert(state == State::NOTHING);
 
 	Handshake();
 }
@@ -426,14 +376,10 @@ void
 Scrobbler::ScheduleHandshake() noexcept
 {
 	assert(config.file.empty());
-	assert(state == SCROBBLER_STATE_NOTHING);
-	assert(!handshake_timer_scheduled);
+	assert(state == State::NOTHING);
+	assert(!handshake_timer.IsPending());
 
-	handshake_timer_scheduled = true;
-
-	handshake_timer.expires_from_now(std::chrono::seconds(interval));
-	handshake_timer.async_wait(std::bind(&Scrobbler::OnHandshakeTimer,
-					     this, std::placeholders::_1));
+	handshake_timer.Schedule(interval);
 }
 
 void
@@ -444,9 +390,9 @@ Scrobbler::SendNowPlaying(const char *artist,
 			  std::chrono::steady_clock::duration length) noexcept
 {
 	assert(config.file.empty());
-	assert(state == SCROBBLER_STATE_READY);
+	assert(state == State::READY);
 
-	state = SCROBBLER_STATE_SUBMITTING;
+	state = State::SUBMITTING;
 
 	FormDataBuilder post_data;
 	post_data.Append("s", session);
@@ -458,14 +404,13 @@ Scrobbler::SendNowPlaying(const char *artist,
 	post_data.Append("n", number);
 	post_data.Append("m", mbid);
 
-	FormatInfo("[%s] sending 'now playing' notification",
-		   config.name.c_str());
+	FmtInfo("[{}] sending 'now playing' notification", config.name);
 
+	HttpResponseHandler &handler = *this;
 	http_request = std::make_unique<CurlRequest>(curl_global,
 						     nowplay_url.c_str(),
 						     std::move(post_data),
-						     scrobbler_submit_handler,
-						     this);
+						     handler);
 }
 
 void
@@ -475,9 +420,13 @@ Scrobbler::ScheduleNowPlaying(const Record &song) noexcept
 		/* there's no "now playing" support for files */
 		return;
 
+	if (config.ignore_list && config.ignore_list->matches_record(song)) {
+		return;
+	}
+
 	now_playing = song;
 
-	if (state == SCROBBLER_STATE_READY && !submit_timer_scheduled)
+	if (state == State::READY && !submit_timer.IsPending())
 		ScheduleSubmit();
 }
 
@@ -488,8 +437,8 @@ Scrobbler::Submit() noexcept
 	unsigned count = 0;
 
 	assert(config.file.empty());
-	assert(state == SCROBBLER_STATE_READY);
-	assert(!submit_timer_scheduled);
+	assert(state == State::READY);
+	assert(!submit_timer.IsPending());
 
 	if (queue.empty()) {
 		/* the submission queue is empty.  See if a "now playing" song is
@@ -505,7 +454,7 @@ Scrobbler::Submit() noexcept
 		return;
 	}
 
-	state = SCROBBLER_STATE_SUBMITTING;
+	state = State::SUBMITTING;
 
 	/* construct the handshake url. */
 	FormDataBuilder post_data;
@@ -534,49 +483,45 @@ Scrobbler::Submit() noexcept
 		count++;
 	}
 
-	FormatInfo("[%s] submitting %i song%s",
-		   config.name.c_str(), count, count == 1 ? "" : "s");
-	FormatDebug("[%s] post data: %s",
-		    config.name.c_str(), post_data.c_str());
-	FormatDebug("[%s] url: %s",
-		    config.name.c_str(),
-		    submit_url.c_str());
+	FmtInfo("[{}] submitting {} song{}",
+		config.name, count, count == 1 ? "" : "s");
+	FmtDebug("[{}] post data: {:?}", config.name, post_data.c_str());
+	FmtDebug("[{}] url: {}", config.name, submit_url);
 
 	pending = count;
 
+	HttpResponseHandler &handler = *this;
 	http_request = std::make_unique<CurlRequest>(curl_global,
 						     submit_url.c_str(),
 						     std::move(post_data),
-						     scrobbler_submit_handler, this);
+						     handler);
 }
 
 void
 Scrobbler::Push(const Record &song) noexcept
 {
+	if (config.ignore_list && config.ignore_list->matches_record(song)) {
+		return;
+	}
+
 	if (file != nullptr) {
-		fprintf(file, "%s %s - %s\n",
-			log_date(),
-			song.artist.c_str(), song.track.c_str());
+		fmt::print(file, "{} {} - {}\n",
+			   log_date(),
+			   song.artist, song.track);
 		fflush(file);
 		return;
 	}
 
 	queue.emplace_back(song);
 
-	if (state == SCROBBLER_STATE_READY && !submit_timer_scheduled)
+	if (state == State::READY && !submit_timer.IsPending())
 		ScheduleSubmit();
 }
 
 void
-Scrobbler::OnSubmitTimer(const boost::system::error_code &error) noexcept
+Scrobbler::OnSubmitTimer() noexcept
 {
-	if (error)
-		return;
-
-	assert(state == SCROBBLER_STATE_READY);
-
-	assert(submit_timer_scheduled);
-	submit_timer_scheduled = false;
+	assert(state == State::READY);
 
 	Submit();
 }
@@ -584,13 +529,10 @@ Scrobbler::OnSubmitTimer(const boost::system::error_code &error) noexcept
 void
 Scrobbler::ScheduleSubmit() noexcept
 {
-	assert(!submit_timer_scheduled);
+	assert(!submit_timer.IsPending());
 	assert(!queue.empty() || record_is_defined(&now_playing));
 
-	submit_timer_scheduled = true;
-	submit_timer.expires_from_now(std::chrono::seconds(interval));
-	submit_timer.async_wait(std::bind(&Scrobbler::OnSubmitTimer,
-					  this, std::placeholders::_1));
+	submit_timer.Schedule(interval);
 }
 
 void
@@ -601,27 +543,63 @@ Scrobbler::WriteJournal() const noexcept
 
 	if (journal_write(config.journal.c_str(), queue)) {
 		unsigned queue_length = queue.size();
-		FormatInfo("[%s] saved %i song%s to %s",
-			   config.name.c_str(),
-			   queue_length, queue_length == 1 ? "" : "s",
-			   config.journal.c_str());
+		FmtInfo("[{}] saved {} song{} to {:?}",
+			config.name,
+			queue_length, queue_length == 1 ? "" : "s",
+			config.journal);
 	}
 }
 
 void
 Scrobbler::SubmitNow() noexcept
 {
-	interval = 1;
+	interval = std::chrono::seconds{1};
 
-	if (handshake_timer_scheduled) {
-		handshake_timer.cancel();
-		handshake_timer_scheduled = false;
+	if (handshake_timer.IsPending()) {
+		handshake_timer.Cancel();
 		ScheduleHandshake();
 	}
 
-	if (submit_timer_scheduled) {
-		submit_timer.cancel();
-		submit_timer_scheduled = false;
+	if (submit_timer.IsPending()) {
+		submit_timer.Cancel();
 		ScheduleSubmit();
+	}
+}
+
+void
+Scrobbler::OnHttpResponse(std::string body) noexcept
+{
+	switch (state) {
+	case State::NOTHING:
+	case State::READY:
+		assert(false);
+		break;
+
+	case State::HANDSHAKE:
+		OnHandshakeResponse(std::move(body));
+		break;
+
+	case State::SUBMITTING:
+		OnSubmitResponse(std::move(body));
+		break;
+	}
+}
+
+void
+Scrobbler::OnHttpError(std::exception_ptr e) noexcept
+{
+	switch (state) {
+	case State::NOTHING:
+	case State::READY:
+		assert(false);
+		break;
+
+	case State::HANDSHAKE:
+		OnHandshakeError(std::move(e));
+		break;
+
+	case State::SUBMITTING:
+		OnSubmitError(std::move(e));
+		break;
 	}
 }

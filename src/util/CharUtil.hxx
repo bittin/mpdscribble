@@ -1,34 +1,7 @@
-/*
- * Copyright (C) 2011-2017 Max Kellermann <max.kellermann@gmail.com>
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * - Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *
- * - Redistributions in binary form must reproduce the above copyright
- * notice, this list of conditions and the following disclaimer in the
- * documentation and/or other materials provided with the
- * distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
- * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
- * FOUNDATION OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
- * OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+// SPDX-License-Identifier: BSD-2-Clause
+// author: Max Kellermann <max.kellermann@gmail.com>
 
-#ifndef CHAR_UTIL_HXX
-#define CHAR_UTIL_HXX
+#pragma once
 
 #ifdef _UNICODE
 #include "WCharUtil.hxx"
@@ -70,10 +43,27 @@ IsWhitespaceFast(const char ch) noexcept
 	return IsWhitespaceOrNull(ch);
 }
 
+/**
+ * Is this a non-printable ASCII character?  Returns false for
+ * non-ASCII characters.
+ *
+ * Note that this is not the opposite of IsNonPrintableASCII().
+ */
 constexpr bool
 IsPrintableASCII(char ch) noexcept
 {
 	return (signed char)ch >= 0x20;
+}
+
+/**
+ * Is this a non-printable character?  Returns false for non-ASCII characters.
+ *
+ * Note that this is not the opposite of IsPrintableASCII()
+ */
+constexpr bool
+IsNonPrintableASCII(char ch) noexcept
+{
+	return (unsigned char)ch < 0x20;
 }
 
 constexpr bool
@@ -106,6 +96,18 @@ IsAlphaNumericASCII(char ch) noexcept
 	return IsAlphaASCII(ch) || IsDigitASCII(ch);
 }
 
+constexpr bool
+IsUpperAlphaNumericASCII(char ch) noexcept
+{
+	return IsUpperAlphaASCII(ch) || IsDigitASCII(ch);
+}
+
+constexpr bool
+IsLowerAlphaNumericASCII(char ch) noexcept
+{
+	return IsLowerAlphaASCII(ch) || IsDigitASCII(ch);
+}
+
 /**
  * Convert the specified ASCII character (0x00..0x7f) to upper case.
  * Unlike toupper(), it ignores the system locale.
@@ -130,4 +132,16 @@ ToLowerASCII(char ch) noexcept
 		: ch;
 }
 
-#endif
+constexpr bool
+IsLowerHexDigit(char ch) noexcept
+{
+	return IsDigitASCII(ch) ||
+		(ch >= 'a' && ch <= 'f');
+}
+
+constexpr bool
+IsHexDigit(char ch) noexcept
+{
+	return IsLowerHexDigit(ch) ||
+		(ch >= 'A' && ch <= 'F');
+}

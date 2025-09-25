@@ -1,0 +1,131 @@
+---
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - 'contrib/**'
+      - 'doc/**'
+      - 'systemd/**'
+    branches:
+      - master
+  pull_request:
+    paths-ignore:
+      - 'contrib/**'
+      - 'doc/**'
+      - 'systemd/**'
+    branches:
+      - master
+
+permissions:
+  contents: read #  to fetch code (actions/checkout)
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        compiler: [gcc14, gcc11, gcc10]
+        include:
+          - compiler: gcc14
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            ldflags: -fuse-ld=mold
+            packages: g++-14 mold libfmt-dev
+            meson_options:
+          - compiler: gcc11
+            os: ubuntu-22.04
+            cc: gcc-11
+            cxx: g++-11
+            ldflags:
+            packages: g++-11
+            meson_options: --force-fallback-for=fmt
+          - compiler: gcc10
+            os: ubuntu-22.04
+            cc: gcc-10
+            cxx: g++-10
+            ldflags:
+            packages: g++-10
+            meson_options: --force-fallback-for=fmt
+          - compiler: clang
+            os: ubuntu-24.04
+            cc: clang
+            cxx: clang++
+            ldflags: -fuse-ld=lld
+            packages: clang lld
+            meson_options: --force-fallback-for=fmt
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CC: ccache ${{ matrix.cc }}
+      CXX: ccache ${{ matrix.cxx }}
+      LDFLAGS: ${{ matrix.ldflags }}
+
+    steps:
+      - id: checkout
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.packages }} \
+            meson \
+            ccache \
+            libsystemd-dev \
+            libgcrypt-dev \
+            libcurl4-gnutls-dev \
+            libmpdclient-dev
+
+      - id: cache-ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ matrix.compiler }}
+
+      - name: Configure
+        run: |
+          meson setup \
+            -Dsystemd=enabled \
+            -Dsyslog=enabled \
+            -Dtest=true \
+            --wrap-mode nofallback \
+            ${{ matrix.meson_options }} \
+            output
+
+      - name: Build
+        run: ninja -C output --verbose
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - id: checkout
+        uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Install dependencies
+        run: |
+          brew install \
+            meson ninja \
+            ccache \
+            libgcrypt \
+            curl \
+            libmpdclient
+
+      - id: cache-ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: macos
+
+      - name: Configure
+        run: |
+          meson setup \
+            -Dtest=true \
+            --wrap-mode nofallback \
+            ${{ matrix.meson_options }} \
+            output
+
+      - name: Build
+        run: ninja -C output --verbose

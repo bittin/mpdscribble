@@ -1,29 +1,19 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "Journal.hxx"
 #include "Record.hxx"
+#include "lib/fmt/ExceptionFormatter.hxx"
+#include "io/BufferedReader.hxx"
+#include "io/FileReader.hxx"
+#include "system/Error.hxx"
 #include "util/StringStrip.hxx"
 #include "Log.hxx"
 
-#include <assert.h>
+#include <fmt/core.h>
+
+#include <cassert>
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,14 +25,14 @@ static void
 journal_write_string(FILE *file, char field, const char *value)
 {
 	if (value != nullptr)
-		fprintf(file, "%c = %s\n", field, value);
+		fmt::print(file, "{} = {}\n", field, value);
 }
 
 static void
 journal_write_string(FILE *file, char field, const std::string &value)
 {
 	if (!value.empty())
-		fprintf(file, "%c = %s\n", field, value.c_str());
+		fmt::print(file, "{} = {}\n", field, value);
 }
 
 static void
@@ -62,10 +52,9 @@ journal_write_record(FILE *file, const Record *record)
 	const auto length_s =
 		std::chrono::duration_cast<std::chrono::seconds>(record->length);
 
-	fprintf(file,
-		"l = %i\no = %s\n\n",
-		(int)length_s.count(),
-		record->source);
+	fmt::print(file, "l = {}\no = {}\n\n",
+		   length_s.count(),
+		   record->source);
 }
 
 bool
@@ -78,7 +67,7 @@ journal_write(const char *path, const std::list<Record> &queue)
 
 	handle = fopen(path, "wb");
 	if (!handle) {
-		FormatError("Failed to save %s: %s", path, strerror(errno));
+		FmtError("Failed to save {:?}: {}", path, strerror(errno));
 		return false;
 	}
 
@@ -104,26 +93,16 @@ journal_commit_record(std::list<Record> &queue, Record &&record)
 
 std::list<Record>
 journal_read(const char *path)
-{
-	FILE *file;
-	char line[1024];
+try {
+	FileReader file{path};
+	BufferedReader reader{file};
+
 	Record record;
 
 	journal_file_empty = true;
 
-	file = fopen(path, "r");
-	if (file == nullptr) {
-		if (errno != ENOENT)
-			/* ENOENT is ignored silently, because the
-			   user might be starting mpdscribble for the
-			   first time */
-			FormatWarning("Failed to load %s: %s",
-				      path, strerror(errno));
-		return {};
-	}
-
 	std::list<Record> queue;
-	while (fgets(line, sizeof(line), file) != nullptr) {
+	while (char *line = reader.ReadLine()) {
 		char *key, *value;
 
 		key = StripLeft(line);
@@ -161,9 +140,14 @@ journal_read(const char *path)
 			record.love = true;
 	}
 
-	fclose(file);
-
 	journal_commit_record(queue, std::move(record));
 
 	return queue;
+} catch (const std::system_error &e) {
+	if (!IsFileNotFound(e))
+		/* ENOENT is ignored silently, because the user might
+		   be starting mpdscribble for the first time */
+		FmtWarning("Failed to load {:?}: {}", path, std::current_exception());
+
+	return {};
 }

@@ -1,41 +1,33 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "ReadConfig.hxx"
+#include "lib/fmt/RuntimeError.hxx"
+#include "io/BufferedReader.hxx"
+#include "io/FileReader.hxx"
 #include "util/Compiler.h"
-#include "util/RuntimeError.hxx"
 #include "util/ScopeExit.hxx"
 #include "util/StringStrip.hxx"
 #include "Config.hxx"
 #include "IniFile.hxx"
 #include "SdDaemon.hxx"
 #include "config.h"
+#include "XdgBaseDirectory.hxx"
+#include "io/Path.hxx"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
 #endif
 
-#include <assert.h>
+#include <cassert>
+
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
+
+#ifndef _WIN32
 #include <sys/stat.h>
+#endif
 
 /*
   default locations for files.
@@ -47,14 +39,14 @@
 #ifndef _WIN32
 
 #define FILE_CACHE "/var/cache/mpdscribble/mpdscribble.cache"
-#define FILE_HOME_CONF "~/.mpdscribble/mpdscribble.conf"
-#define FILE_HOME_CACHE "~/.mpdscribble/mpdscribble.cache"
 
 #endif
 
-#define AS_HOST "http://post.audioscrobbler.com/"
+#define AS_HOST "https://post.audioscrobbler.com/"
 
-gcc_pure
+#ifndef _WIN32
+
+[[gnu::pure]]
 static bool
 file_exists(const char *filename) noexcept
 {
@@ -62,36 +54,31 @@ file_exists(const char *filename) noexcept
 	return stat(filename, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static std::string
-file_expand_tilde(const char *path)
-{
-	const char *home;
-
-	if (path[0] != '~')
-		return path;
-
-	home = getenv("HOME");
-	if (!home)
-		home = "./";
-
-	return std::string(home) + (path + 1);
-}
+#endif
 
 static std::string
 get_default_config_path(Config &config)
 {
 #ifndef _WIN32
-	auto file = file_expand_tilde(FILE_HOME_CONF);
-	if (file_exists(file.c_str())) {
-		config.loc = file_home;
-		return file;
-	} else {
-		if (!file_exists(FILE_CONF))
-			return {};
-
-		config.loc = file_etc;
-		return FILE_CONF;
+	if (auto dir = GetUserConfigDirectory(PACKAGE); !dir.empty()) {
+		auto path = BuildPath(dir, "mpdscribble.conf");
+		if (file_exists(path.c_str())) {
+			config.loc = file_home;
+			return path;
+		}
 	}
+
+	const char *HOME = getenv("HOME");
+	if (HOME != nullptr) {
+		auto path = BuildPath(HOME, ".mpdscribble/mpdscribble.conf");
+		if (file_exists(path.c_str())) {
+			config.loc = file_home;
+			return path;
+		}
+	}
+
+	config.loc = file_etc;
+	return FILE_CONF;
 #else
 	(void)config;
 	return "mpdscribble.conf";
@@ -110,13 +97,55 @@ get_default_log_path() noexcept
 #endif
 }
 
+#ifndef _WIN32
+
+[[gnu::pure]]
+static std::string
+GetXdgCachePath() noexcept
+{
+	auto dir = GetUserCacheDirectory(PACKAGE);
+	if (dir.empty())
+		return {};
+
+	mkdir(dir.c_str(), 0777);
+	return BuildPath(dir, "mpdscribble.cache");
+}
+
+[[gnu::pure]]
+static std::string
+GetLegacyHomeCachePath() noexcept
+{
+	const char *home = getenv("HOME");
+	if (home == nullptr)
+		return {};
+
+	return std::string(home) + "/.mpdscribble/mpdscribble.cache";
+}
+
+[[gnu::pure]]
+static std::string
+GetHomeCachePath() noexcept
+{
+	std::string xdg_path = GetXdgCachePath();
+	std::string legacy_path = GetLegacyHomeCachePath();
+
+	if (xdg_path.empty() ||
+	    (!legacy_path.empty() && !file_exists(xdg_path.c_str()) &&
+	     file_exists(legacy_path.c_str())))
+		return legacy_path;
+
+	return xdg_path;
+}
+
+#endif
+
 static std::string
 get_default_cache_path(const Config &config)
 {
 #ifndef _WIN32
 	switch (config.loc) {
 	case file_home:
-		return file_expand_tilde(FILE_HOME_CACHE);
+		return GetHomeCachePath();
 
 	case file_etc:
 		return FILE_CACHE;
@@ -184,7 +213,7 @@ load_integer(const IniFile &file, const char *name, int *value_r)
 	char *endptr;
 	auto value = strtol(s, &endptr, 10);
 	if (endptr == s || *endptr != 0)
-		throw FormatRuntimeError("Not a number: '%s'", s);
+		throw FmtRuntimeError("Not a number: {:?}", s);
 
 	*value_r = value;
 	return true;
@@ -199,16 +228,144 @@ load_unsigned(const IniFile &file, const char *name, unsigned *value_r)
 		return false;
 
 	if (value < 0)
-		throw FormatRuntimeError("Setting '%s' must not be negative", name);
+		throw FmtRuntimeError("Setting {:?} must not be negative", name);
 
 	*value_r = (unsigned)value;
 	return true;
 }
 
+static std::unordered_map<std::string, std::string>
+parse_ignore_list_line(std::string_view input)
+{
+	IgnoreListEntry ignore_list_entry;
+
+	/*
+	  Format: tag1="value1" tag2="value2" ...
+	  Backslash escaping is supported.
+	*/
+
+	enum class ParserState {
+		ExpectTagStart,
+		InTag,
+		ExpectQuote,
+		InValue,
+		InEscapeSequence
+	} state = ParserState::ExpectTagStart;
+
+	std::string current_tag;
+	std::string current_value;
+	std::unordered_map<std::string, std::string> result;
+
+	for (size_t i = 0; i < input.length(); ++i) {
+		char c = input[i];
+
+		switch (state) {
+			case ParserState::ExpectTagStart:
+				if (std::isspace(c)) continue;
+				if (std::isalpha(c)) {
+					current_tag = c;
+					state = ParserState::InTag;
+				} else {
+					throw FmtRuntimeError("Error at position {}: expected tag start, got: '{}'", i, c);
+				}
+				break;
+
+			case ParserState::InTag:
+				if (std::isalpha(c)) {
+					current_tag += c;
+				} else if (c == '=') {
+					state = ParserState::ExpectQuote;
+				} else {
+					throw FmtRuntimeError("Error at position {}: invalid tag character, got: '{}'", i, c);
+				}
+				break;
+
+			case ParserState::ExpectQuote:
+				if (c == '"') {
+					current_value.clear();
+					state = ParserState::InValue;
+				} else {
+					throw FmtRuntimeError("Error at position %d: expected quote, got: '{}'", i, c);
+				}
+				break;
+
+			case ParserState::InValue:
+				if (c == '\\') {
+					state = ParserState::InEscapeSequence;
+				} else if (c == '"') {
+					if (result.contains(current_tag)) {
+						throw FmtRuntimeError("Error at position {}: tag {:?} is duplicated", i, current_tag);
+					}
+					result.emplace(std::move(current_tag), std::move(current_value));
+					state = ParserState::ExpectTagStart;
+				} else {
+					current_value += c;
+				}
+				break;
+
+			case ParserState::InEscapeSequence:
+				current_value += c;
+				state = ParserState::InValue;
+				break;
+		}
+	}
+
+	if (state != ParserState::ExpectTagStart) {
+		throw std::runtime_error{"Unexpected end of line"};
+	}
+
+	return result;
+}
+
+static IgnoreList*
+load_ignore_list(const std::string& path, Config::IgnoreListMap& ignore_lists)
+{
+	FileReader file{path.c_str()};
+	BufferedReader reader{file};
+
+	IgnoreList ignore_list;
+
+	while (const char *_line = reader.ReadLine()) {
+		std::string_view line{_line};
+
+		if (line.empty()) {
+			continue;
+		}
+
+		try {
+			auto parsed_line = parse_ignore_list_line(line);
+
+			if (parsed_line.empty()) {
+				continue;
+			}
+
+			IgnoreListEntry entry{};
+
+			for (auto& [tag, value] : parsed_line) {
+#define set_tag_entry(tagname) if (tag == #tagname) { entry.tagname = std::move(value); continue; }
+				set_tag_entry(artist)
+				set_tag_entry(album)
+				set_tag_entry(title)
+				set_tag_entry(track)
+#undef set_tag_entry
+				throw FmtRuntimeError("Unsupported tag: {:?}", tag);
+			}
+
+			ignore_list.entries.emplace_back(std::move(entry));
+		} catch (const std::runtime_error& error) {
+			throw FmtRuntimeError("Error loading ignore list {:?}: Error parsing line {}: {}",
+					      path, reader.GetLineNumber(), error.what());
+		}
+	}
+
+	return &(ignore_lists[path] = std::move(ignore_list));
+}
+
 static ScrobblerConfig
 load_scrobbler_config(const Config &config,
 		      const std::string &section_name,
-		      const IniSection &section)
+		      const IniSection &section,
+		      Config::IgnoreListMap& ignore_lists)
 {
 	ScrobblerConfig scrobbler;
 
@@ -222,7 +379,7 @@ load_scrobbler_config(const Config &config,
 		if (scrobbler.file.empty()) {
 			scrobbler.url = GetStdString(section, "url");
 			if (scrobbler.url.empty())
-				throw std::runtime_error("Section has neither 'file' nor 'url'");
+				throw FmtRuntimeError("Section {:?} has neither 'file' nor 'url'", section_name);
 		}
 	}
 
@@ -242,6 +399,17 @@ load_scrobbler_config(const Config &config,
 		scrobbler.journal = GetStdString(section, "cache");
 		if (scrobbler.journal.empty())
 			scrobbler.journal = get_default_cache_path(config);
+	}
+
+	std::string ignore_list = GetStdString(section, "ignore");
+	if (!ignore_list.empty()) {
+		if (auto existing_ignore_list = ignore_lists.find(ignore_list); existing_ignore_list != ignore_lists.end()) {
+			scrobbler.ignore_list = &existing_ignore_list->second;
+		} else {
+			scrobbler.ignore_list = load_ignore_list(ignore_list, ignore_lists);
+		}
+	} else {
+		scrobbler.ignore_list = nullptr;
 	}
 
 	return scrobbler;
@@ -274,7 +442,8 @@ load_config_file(Config &config, const char *path)
 
 		config.scrobblers.emplace_front(load_scrobbler_config(config,
 								      section.first,
-								      section.second));
+								      section.second,
+								      config.ignore_lists));
 	}
 }
 
@@ -293,8 +462,8 @@ file_read_config(Config &config)
 		throw std::runtime_error("cannot find configuration file");
 
 	if (config.scrobblers.empty())
-		throw FormatRuntimeError("No audioscrobbler host configured in %s",
-					 config.conf.c_str());
+		throw FmtRuntimeError("No audioscrobbler host configured in {:?}",
+				      config.conf);
 
 	if (config.log.empty())
 		config.log = get_default_log_path();

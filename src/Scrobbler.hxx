@@ -1,30 +1,12 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #ifndef SCROBBLER_HXX
 #define SCROBBLER_HXX
 
-#include "AsioServiceFwd.hxx"
+#include "lib/curl/Handler.hxx"
+#include "event/CoarseTimerEvent.hxx"
 #include "Record.hxx"
-
-#include <boost/asio/steady_timer.hpp>
 
 #include <list>
 #include <memory>
@@ -36,42 +18,49 @@ struct ScrobblerConfig;
 class CurlGlobal;
 class CurlRequest;
 
-class Scrobbler {
+class Scrobbler final : HttpResponseHandler {
 	const ScrobblerConfig &config;
 
 	FILE *file = nullptr;
 
-	enum scrobbler_state {
+	enum class State {
 		/**
 		 * mpdscribble has started, and doesn't have a session yet.
 		 * Handshake to be submitted.
 		 */
-		SCROBBLER_STATE_NOTHING,
+		NOTHING,
 
 		/**
 		 * Handshake is in progress, waiting for the server's
 		 * response.
 		 */
-		SCROBBLER_STATE_HANDSHAKE,
+		HANDSHAKE,
 
 		/**
 		 * We have a session, and we're ready to submit.
 		 */
-		SCROBBLER_STATE_READY,
+		READY,
 
 		/**
 		 * Submission in progress, waiting for the server's response.
 		 */
-		SCROBBLER_STATE_SUBMITTING,
-	} state = SCROBBLER_STATE_NOTHING;
+		SUBMITTING,
+	} state = State::NOTHING;
 
-	unsigned interval = 1;
+	static constexpr Event::Duration MIN_INTERVAL = std::chrono::minutes{1};
+
+	/**
+	 * Maximum exponential backoff delay.
+	 */
+	static constexpr Event::Duration MAX_INTERVAL = std::chrono::minutes{8};
+
+	Event::Duration interval = std::chrono::seconds{1};
 
 	CurlGlobal &curl_global;
 
 	std::unique_ptr<CurlRequest> http_request;
 
-	boost::asio::steady_timer handshake_timer, submit_timer;
+	CoarseTimerEvent handshake_timer, submit_timer;
 
 	std::string session;
 	std::string nowplay_url;
@@ -90,11 +79,9 @@ class Scrobbler {
 	 */
 	unsigned pending = 0;
 
-	bool handshake_timer_scheduled = false, submit_timer_scheduled = false;
-
 public:
 	Scrobbler(const ScrobblerConfig &_config,
-		  boost::asio::io_service &io_service,
+		  EventLoop &event_loop,
 		  CurlGlobal &_curl_global);
 	~Scrobbler() noexcept;
 
@@ -119,18 +106,18 @@ private:
 	void Submit() noexcept;
 	void IncreaseInterval() noexcept;
 
-	void OnHandshakeTimer(const boost::system::error_code &error) noexcept;
-	void OnSubmitTimer(const boost::system::error_code &error) noexcept;
+	void OnHandshakeTimer() noexcept;
+	void OnSubmitTimer() noexcept;
 
 public:
-	static void OnHandshakeResponse(std::string body,
-					void *data) noexcept;
-	static void OnHandshakeError(std::exception_ptr e,
-				     void *data) noexcept;
-	static void OnSubmitResponse(std::string body,
-					void *data) noexcept;
-	static void OnSubmitError(std::exception_ptr e,
-				  void *data) noexcept;
+	void OnHandshakeResponse(std::string body) noexcept;
+	void OnHandshakeError(std::exception_ptr e) noexcept;
+	void OnSubmitResponse(std::string body) noexcept;
+	void OnSubmitError(std::exception_ptr e) noexcept;
+
+	/* virtual methods from class HttpResponseHandler */
+	void OnHttpResponse(std::string body) noexcept override;
+	void OnHttpError(std::exception_ptr e) noexcept override;
 };
 
 #endif /* SCROBBLER_H */

@@ -1,27 +1,10 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "CommandLine.hxx"
+#include "lib/fmt/RuntimeError.hxx"
 #include "util/OptionDef.hxx"
 #include "util/OptionParser.hxx"
-#include "util/RuntimeError.hxx"
 #include "Config.hxx"
 #include "config.h"
 
@@ -38,7 +21,7 @@ static const char *summary =
 	"A Music Player Daemon (MPD) client which submits information about\n"
 	"tracks being played to Last.fm (formerly Audioscrobbler).";
 
-gcc_noreturn
+[[noreturn]]
 static void
 version() noexcept
 {
@@ -97,7 +80,7 @@ PrintOption(const OptionDef &opt) noexcept
 		       opt.GetDescription());
 }
 
-gcc_noreturn
+[[noreturn]]
 static void
 help() noexcept
 {
@@ -169,5 +152,5 @@ parse_cmdline(Config &config, int argc, char **argv)
 
 	const auto remaining = parser.GetRemaining();
 	if (!remaining.empty())
-		throw FormatRuntimeError("Unknown option: %s", remaining.front());
+		throw FmtRuntimeError("Unknown option: {:?}", remaining.front());
 }

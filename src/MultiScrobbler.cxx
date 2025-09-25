@@ -1,22 +1,5 @@
-/* mpdscribble (MPD Client)
- * Copyright (C) 2008-2019 The Music Player Daemon Project
- * Copyright (C) 2005-2008 Kuno Woudt <kuno@frob.nl>
- * Project homepage: http://musicpd.org
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-*/
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright The Music Player Daemon Project
 
 #include "MultiScrobbler.hxx"
 #include "Scrobbler.hxx"
@@ -28,13 +11,13 @@
 #include <string.h>
 
 MultiScrobbler::MultiScrobbler(const std::forward_list<ScrobblerConfig> &configs,
-			       boost::asio::io_service &io_service,
+			       EventLoop &event_loop,
 			       CurlGlobal &curl_global)
 {
-	FormatInfo("starting mpdscribble (" AS_CLIENT_ID " " AS_CLIENT_VERSION ")");
+	LogInfo("starting mpdscribble (" AS_CLIENT_ID " " AS_CLIENT_VERSION ")");
 
 	for (const auto &i : configs)
-		scrobblers.emplace_front(i, io_service, curl_global);
+		scrobblers.emplace_front(i, event_loop, curl_global);
 }
 
 MultiScrobbler::~MultiScrobbler() noexcept = default;
@@ -93,14 +76,14 @@ MultiScrobbler::SongChange(const char *file, const char *artist, const char *tra
 	   everything else is mandatory.
 	 */
 	if (!(artist && strlen(artist))) {
-		FormatWarning("empty artist, not submitting; "
-			      "please check the tags on %s\n", file);
+		FmtWarning("empty artist, not submitting; "
+			   "please check the tags on {:?}");
 		return;
 	}
 
 	if (!(track && strlen(track))) {
-		FormatWarning("empty title, not submitting; "
-			      "please check the tags on %s", file);
+		FmtWarning("empty title, not submitting; "
+			   "please check the tags on {:?}", file);
 		return;
 	}
 
@@ -121,10 +104,10 @@ MultiScrobbler::SongChange(const char *file, const char *artist, const char *tra
 	record.love = love;
 	record.source = strstr(file, "://") == nullptr ? "P" : "R";
 
-	FormatInfo("%s, songchange: %s - %s (%i)\n",
-		   record.time.c_str(), record.artist.c_str(),
-		   record.track.c_str(),
-		   (int)std::chrono::duration_cast<std::chrono::seconds>(record.length).count());
+	FmtInfo("{}, songchange: {} - {} ({})",
+		record.time, record.artist,
+		record.track,
+		std::chrono::duration_cast<std::chrono::seconds>(record.length).count());
 
 	for (auto &i : scrobblers)
 		i.Push(record);
